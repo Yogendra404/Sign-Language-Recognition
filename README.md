@@ -48,7 +48,7 @@ Run all commands from the project root.
 
 ## Results
 - Test accuracy: 99.34% (602 test samples, 7 signs)
-- Live accuracy: _add your own results here_
+- Live accuracy: _100% (70/70 correct, 10 trials per sign, webcam, normal indoor lighting)_
 
 ## Tech stack
 Python, OpenCV, MediaPipe, scikit-learn, NumPy, pandas, pyttsx3
