@@ -1,123 +1,212 @@
+import os
 import time
 import threading
+import subprocess
+import glob
 from collections import deque, Counter
 
 import cv2
 import joblib
-import mediapipe as mp
 import numpy as np
-import pyttsx3
+import mediapipe as mp
 
-MODEL_PATH = "models/sign_model.pkl"
-CONF_THRESHOLD = 0.70   # minimum model confidence to accept a prediction
-WINDOW = 10             # frames used for smoothing
-STABLE_COUNT = 8        # how many of the last WINDOW frames must agree
-COOLDOWN = 2.0          # seconds before the same word can be spoken again
+# ---------- Optional: .env + Groq (works without them) ----------
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
-model = joblib.load(MODEL_PATH)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+groq_client = None
+if GROQ_API_KEY:
+    try:
+        from groq import Groq
+        groq_client = Groq(api_key=GROQ_API_KEY)
+    except Exception as e:
+        print("Groq not available:", e)
 
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
-hands = mp_hands.Hands(max_num_hands=1,
-                       min_detection_confidence=0.7,
-                       min_tracking_confidence=0.7)
+# ---------- Settings ----------
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def normalize(row):
-    """Must match the normalize() used in train_model.py."""
-    pts = np.array(row, dtype=np.float32).reshape(21, 3)
+def find_model():
+    """Use MODEL_PATH from .env if valid, else auto-find a .pkl/.joblib in the project."""
+    env_path = os.getenv("MODEL_PATH")
+    if env_path:
+        p = env_path if os.path.isabs(env_path) else os.path.join(PROJECT_ROOT, env_path)
+        if os.path.exists(p):
+            return p
+    patterns = ["models/*.pkl", "models/*.joblib", "*.pkl", "*.joblib",
+                "src/*.pkl", "src/*.joblib", "**/*.pkl", "**/*.joblib"]
+    for pat in patterns:
+        hits = [h for h in glob.glob(os.path.join(PROJECT_ROOT, pat), recursive=True)
+                if "venv" not in h.split(os.sep)]
+        if hits:
+            return hits[0]
+    return None
+
+
+MODEL_PATH = find_model()
+CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", 0))
+CONF_THRESHOLD = float(os.getenv("PREDICTION_CONFIDENCE_THRESHOLD", 0.8))
+SMOOTHING_WINDOW = int(os.getenv("SMOOTHING_WINDOW", 10))
+SPEAK_COOLDOWN = 2.0  # seconds between spoken words
+
+
+# ---------- Speech (Windows built-in voice, no extra install) ----------
+def _speak(text):
+    safe = text.replace("'", "")
+    cmd = (
+        "Add-Type -AssemblyName System.Speech; "
+        f"(New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{safe}')"
+    )
+    subprocess.run(["powershell", "-Command", cmd], creationflags=0x08000000)
+
+
+def speak_async(text):
+    threading.Thread(target=_speak, args=(text,), daemon=True).start()
+
+
+# ---------- Sentence builder (Groq, with offline fallback) ----------
+def build_sentence(signs):
+    fallback = " ".join(signs)
+    if groq_client is None or not signs:
+        return fallback
+    try:
+        resp = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Convert these sign language words into one short, "
+                               "natural English sentence. Reply with the sentence only.",
+                },
+                {"role": "user", "content": " ".join(signs)},
+            ],
+            max_tokens=40,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        print("Groq error, using fallback:", e)
+        return fallback
+
+
+# ---------- Features ----------
+# Matches the normalization used when the model was trained
+# (same as normalize() in evaluate_live.py):
+# subtract the wrist, then divide by the max absolute value.
+def extract_features(hand_landmarks):
+    feats = []
+    for lm in hand_landmarks.landmark:
+        feats.extend([lm.x, lm.y, lm.z])
+    pts = np.array(feats, dtype=np.float32).reshape(21, 3)
     pts = pts - pts[0]
     scale = np.max(np.abs(pts))
     if scale > 0:
         pts = pts / scale
-    return pts.flatten()
+    return pts.flatten().reshape(1, -1)
 
 
-speaking = False
+def main():
+    if MODEL_PATH is None:
+        print("No model file (.pkl / .joblib) found. Run: python src/train_model.py")
+        return
+    print("Loading model:", MODEL_PATH)
+    model = joblib.load(MODEL_PATH)
+    print("Model loaded. Classes:", list(model.classes_))
 
+    mp_hands = mp.solutions.hands
+    mp_draw = mp.solutions.drawing_utils
+    hands = mp_hands.Hands(
+        static_image_mode=False,
+        max_num_hands=1,
+        min_detection_confidence=0.7,
+        min_tracking_confidence=0.5,
+    )
 
-def speak(text):
-    """Speak in a background thread so the video doesn't freeze."""
-    global speaking
-    if speaking:
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened():
+        print("Cannot open camera. Try CAMERA_INDEX=1")
         return
 
-    def run():
-        global speaking
-        speaking = True
-        try:
-            engine = pyttsx3.init()
-            engine.say(text)
-            engine.runAndWait()
-            engine.stop()
-        finally:
-            speaking = False
+    recent = deque(maxlen=SMOOTHING_WINDOW)
+    collected = []          # confirmed signs for the sentence
+    last_spoken = ""
+    last_time = 0.0
+    sentence = ""
+    current_label = ""
 
-    threading.Thread(target=run, daemon=True).start()
+    print("Keys: s = build + speak sentence | c = clear | q = quit")
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frame = cv2.flip(frame, 1)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = hands.process(rgb)
+
+        current_label = ""
+        if result.multi_hand_landmarks:
+            hand = result.multi_hand_landmarks[0]
+            mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
+
+            X = extract_features(hand)
+            probs = model.predict_proba(X)[0]
+            idx = int(np.argmax(probs))
+            label = str(model.classes_[idx])
+            conf = float(probs[idx])
+
+            if conf >= CONF_THRESHOLD:
+                recent.append(label)
+                current_label = f"{label} ({conf*100:.0f}%)"
+            else:
+                recent.append(None)
+
+            # stable = same label for most of the window
+            if len(recent) == SMOOTHING_WINDOW:
+                common, count = Counter(recent).most_common(1)[0]
+                if common is not None and count >= int(SMOOTHING_WINDOW * 0.8):
+                    now = time.time()
+                    if common != last_spoken and now - last_time > SPEAK_COOLDOWN:
+                        print("Speaking:", common)
+                        speak_async(common)
+                        collected.append(common)
+                        last_spoken = common
+                        last_time = now
+        else:
+            recent.clear()
+            last_spoken = ""  # allow the same sign again after hand leaves
+
+        # ---------- On-screen text ----------
+        cv2.putText(frame, f"Sign: {current_label}", (10, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(frame, "Words: " + " ".join(collected[-6:]), (10, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        if sentence:
+            cv2.putText(frame, sentence[:70], (10, 105),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+
+        cv2.imshow("Sign Language Recognition", frame)
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord("q"):
+            break
+        elif key == ord("c"):
+            collected.clear()
+            sentence = ""
+        elif key == ord("s") and collected:
+            sentence = build_sentence(collected)
+            print("Sentence:", sentence)
+            speak_async(sentence)
+            collected.clear()
+
+    cap.release()
+    cv2.destroyAllWindows()
+    hands.close()
 
 
-history = deque(maxlen=WINDOW)
-current_word = ""
-last_spoken = ""
-last_spoken_time = 0.0
-sentence = []
-
-cap = cv2.VideoCapture(0)
-print("Q = quit | C = clear sentence")
-
-while True:
-    ok, frame = cap.read()
-    if not ok:
-        break
-    frame = cv2.flip(frame, 1)
-    result = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-
-    label, conf = "", 0.0
-    if result.multi_hand_landmarks:
-        lm = result.multi_hand_landmarks[0]
-        mp_drawing.draw_landmarks(frame, lm, mp_hands.HAND_CONNECTIONS)
-
-        raw = []
-        for p in lm.landmark:
-            raw += [p.x, p.y, p.z]
-        x = normalize(raw).reshape(1, -1)
-
-        probs = model.predict_proba(x)[0]
-        idx = int(np.argmax(probs))
-        conf = float(probs[idx])
-        if conf >= CONF_THRESHOLD:
-            label = model.classes_[idx]
-        history.append(label)
-    else:
-        history.append("")
-
-    # Smoothing: accept a word only if it dominates the recent frames
-    word, votes = Counter(history).most_common(1)[0] if history else ("", 0)
-    if word and votes >= STABLE_COUNT:
-        current_word = word
-        now = time.time()
-        if word != last_spoken or (now - last_spoken_time) > COOLDOWN:
-            speak(word)
-            last_spoken, last_spoken_time = word, now
-            if not sentence or sentence[-1] != word:
-                sentence.append(word)
-    elif not result.multi_hand_landmarks:
-        current_word = ""
-
-    # On-screen display
-    cv2.putText(frame, f"Sign: {current_word or '...'}", (10, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 0), 3)
-    cv2.putText(frame, f"Confidence: {conf:.2f}", (10, 75),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    cv2.putText(frame, " ".join(sentence[-6:]), (10, frame.shape[0] - 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
-
-    cv2.imshow("Sign Language Recognition", frame)
-    key = cv2.waitKey(1) & 0xFF
-    if key == ord('q'):
-        break
-    if key == ord('c'):
-        sentence.clear()
-
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    main()
